@@ -1,0 +1,6 @@
+bin/
+build/
+*.o
+data/tables/
+data/indexes/
+data/wal/
