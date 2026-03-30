@@ -215,6 +215,9 @@ make test
 
 # Run the performance benchmark (server must be running)
 ./scripts/benchmark.sh 127.0.0.1 9000 1000000
+
+# Run insert benchmark (adjust row count)
+./bin/benchmark_flexql 1000000
 ```
 
 ---
