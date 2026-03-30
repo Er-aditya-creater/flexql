@@ -202,7 +202,7 @@ flexql/
 
 ```bash
 # Build both binaries
-make
+make all bin/benchmark_flexql
 
 # Start the server (default port 9000)
 ./bin/flexql-server 9000
