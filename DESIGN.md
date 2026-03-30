@@ -183,6 +183,7 @@ flexql/
 │   ├── cache/lru_cache.h     LRUCache declaration
 │   ├── network/protocol.h    Wire protocol constants
 │   ├── expiration/ttl.h      isExpired() inline function
+│   ├──storage/storage.h     Header file storae
 │   └── concurrency/          MutexGuard RAII wrapper
 │       mutex_guard.h
 └── src/
@@ -191,7 +192,8 @@ flexql/
     ├── cache/lru_cache.cpp   LRU cache implementation
     ├── query/engine.cpp      SQL engine (CREATE/INSERT/SELECT/INNER JOIN)
     ├── server/server.cpp     TCP server — no engine code
-    └── client/client.cpp     C API + REPL — no server code
+    ├──client/client.cpp     C API + REPL — no server code
+    └── storage/storage.cpp   storage implementation
 ```
 
 ---

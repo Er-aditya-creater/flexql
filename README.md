@@ -161,12 +161,14 @@ flexql/
 │   ├── cache/lru_cache.h   — LRUCache
 │   ├── network/protocol.h  — wire protocol constants
 │   ├── expiration/ttl.h    — isExpired()
+│   ├──storage/storage.h     Header file storae
 │   └── concurrency/        — MutexGuard RAII wrapper
 ├── src/
 │   ├── parser/lexer.cpp
 │   ├── parser/parser.cpp
 │   ├── cache/lru_cache.cpp
 │   ├── query/engine.cpp    — CREATE / INSERT / SELECT / INNER JOIN
+│   ├── storage/storage.cpp   storage implementation
 │   ├── server/server.cpp   — TCP server only
 │   └── client/
 │       ├── flexql_api.cpp  — C API implementation (no main)
