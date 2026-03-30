@@ -11,7 +11,7 @@ static const char* KEYWORDS[] = {
     "INT","INTEGER","DECIMAL","FLOAT","DOUBLE","NUMERIC",
     "VARCHAR","TEXT","CHAR",
     "DATETIME","DATE","TIME",
-    "PRIMARY","KEY","NOT","NULL",
+    "PRIMARY","KEY","NOT","NULL","IF","EXISTS","ORDER","BY","ASC","DESC","DELETE",
     nullptr
 };
 

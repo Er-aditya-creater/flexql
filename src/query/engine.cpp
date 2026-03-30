@@ -14,6 +14,7 @@
 #include <numeric>
 #include <sstream>
 #include <ctime>
+#include <iostream>
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -97,6 +98,14 @@ ColType Engine::parseColType(TokenStream& ts) {
     else if (t=="DATETIME"||t=="DATE"||t=="TIME")                 ct = ColType::DATETIME;
     else throw std::runtime_error(
         "Unsupported type '" + t + "'. Use INT, DECIMAL, VARCHAR, or DATETIME.");
+    // Consume optional size parameter: VARCHAR(64), DECIMAL(10,2) etc.
+    if (ts.check(TT::LPAREN)) {
+        ts.consume();                                        // consume (
+        while (!ts.atEnd() && !ts.check(TT::RPAREN))
+            ts.consume();                                    // consume 64 / 10,2 etc.
+        if (ts.check(TT::RPAREN)) ts.consume();             // consume )
+    }
+    // Consume optional modifiers: PRIMARY KEY NOT NULL
     while (ts.peek().type == TT::KEYWORD) {
         const std::string& kw = ts.peek().value;
         if (kw=="PRIMARY"||kw=="KEY"||kw=="NOT"||kw=="NULL") ts.consume(); else break;
@@ -129,6 +138,33 @@ CellValue Engine::buildCell(const Token& tok, ColType ct, const std::string& col
         throw std::runtime_error("DATETIME expected for '"+col+"', got '"+tok.value+"'");
     }
     throw std::runtime_error("Unknown type");
+}
+
+// ── Constructor: open storage and recover ─────────────────────────────────────
+Engine::Engine() {
+    std::string dataDir = "data/tables";
+    std::string walPath = "data/wal/flexql.wal";
+
+    // Ensure directories exist
+    system("mkdir -p data/tables data/wal");
+
+    if (!storage_.open(dataDir, walPath)) {
+        std::cerr << "[engine] WARNING: Could not open storage. Running without persistence.\n";
+        return;
+    }
+    if (!storage_.recover(db_)) {
+        std::cerr << "[engine] WARNING: Recovery failed. Starting with empty database.\n";
+    }
+    std::cerr << "[engine] Ready. " << db_.tables.size() << " table(s) loaded from storage.\n";
+}
+
+void Engine::forceCheckpoint() {
+    storage_.checkpoint(db_);
+}
+
+void Engine::maybeCheckpoint() {
+    if (++opCount_ % CHECKPOINT_INTERVAL == 0)
+        storage_.checkpoint(db_);
 }
 
 // ── execute() ─────────────────────────────────────────────────────────────────
@@ -181,6 +217,7 @@ QueryResult Engine::execute(const std::string& rawQuery) {
         if      (kw=="CREATE") doCreate(ts, qr);
         else if (kw=="INSERT") doInsert(ts, qr);
         else if (kw=="SELECT") doSelect(ts, qr);
+        else if (kw=="DELETE") doDelete(ts, qr);
         else { qr.ok=false; qr.message="Unknown command: "+kw; }
     } catch (const std::exception& e) {
         qr.ok=false; qr.message=e.what();
@@ -206,8 +243,17 @@ QueryResult Engine::execute(const std::string& rawQuery) {
 // ── CREATE TABLE ──────────────────────────────────────────────────────────────
 void Engine::doCreate(TokenStream& ts, QueryResult& qr) {
     ts.expectKeyword("CREATE"); ts.expectKeyword("TABLE");
+    // Support: CREATE TABLE IF NOT EXISTS name (...)
+    bool ifNotExists = false;
+    if (ts.peek().type == TT::KEYWORD && ts.peek().value == "IF") {
+        ts.consume();
+        ts.expectKeyword("NOT");
+        ts.expectKeyword("EXISTS");
+        ifNotExists = true;
+    }
     std::string tName = ts.expectName();
     if (db_.tables.count(tName)) {
+        if (ifNotExists) { qr.message="Table '"+tName+"' already exists (skipped)."; return; }
         qr.ok=false; qr.message="Table '"+tName+"' already exists."; return;
     }
     ts.expect(TT::LPAREN, "(");
@@ -220,7 +266,10 @@ void Engine::doCreate(TokenStream& ts, QueryResult& qr) {
     ts.expect(TT::RPAREN, ")");
     if (ts.check(TT::SEMICOLON)) ts.consume();
     db_.tables[tName] = std::move(tbl);
-    cache_.invalidateTable(tName);  // evict stale cached queries
+    // Persist: write CREATE_TABLE to WAL before returning success
+    storage_.walCreateTable(db_.tables[tName]);
+    cache_.invalidateTable(tName);
+    maybeCheckpoint();
     qr.message = "Table '"+tName+"' created successfully.";
 }
 
@@ -247,13 +296,45 @@ void Engine::doInsert(TokenStream& ts, QueryResult& qr) {
         long long ttl = (long long)std::stod(t.value);
         if (ttl<=0) { qr.ok=false; qr.message="TTL must be positive."; return; }
         row.expires = time(nullptr)+ttl;
-        tbl.hasTTLRows = true;   // mark table; SELECTs won't be cached
+        tbl.hasTTLRows = true;
     }
+    // Collect all rows first (WAL-then-memory for atomicity)
+    std::vector<Row> rowsBatch;
+    rowsBatch.push_back(std::move(row));
+
+    // Multi-row INSERT: VALUES (r1),(r2),(r3),...
+    while (ts.check(TT::COMMA)) {
+        ts.consume();
+        if (!ts.check(TT::LPAREN)) break;
+        ts.consume();
+        Row rowN;
+        for (std::size_t c=0; c<tbl.columns.size(); ++c) {
+            if (c>0) ts.expect(TT::COMMA, ",");
+            Token v = ts.consume();
+            try { rowN.cells.push_back(buildCell(v, tbl.columns[c].type, tbl.columns[c].name)); }
+            catch (const std::exception& e) { qr.ok=false; qr.message=e.what(); return; }
+        }
+        ts.expect(TT::RPAREN, ")");
+        rowsBatch.push_back(std::move(rowN));
+    }
+
     if (ts.check(TT::SEMICOLON)) ts.consume();
-    tbl.primaryIndex[cellStr(row.cells[0], tbl.columns[0].type)].push_back(tbl.rows.size());
-    tbl.rows.push_back(std::move(row));
-    cache_.invalidateTable(tName);  // keep cache consistent after write
-    qr.message = "1 row inserted into '"+tName+"'.";
+
+    // Build column type list for WAL serialisation
+    std::vector<ColType> colTypes;
+    for (auto& col : tbl.columns) colTypes.push_back(col.type);
+
+    // Write entire batch as ONE WAL record (single fsync) for performance,
+    // then update memory. This is the key optimisation for batch inserts.
+    storage_.walInsertBatch(tName, rowsBatch, colTypes);
+    for (auto& r : rowsBatch) {
+        tbl.primaryIndex[cellStr(r.cells[0], tbl.columns[0].type)].push_back(tbl.rows.size());
+        tbl.rows.push_back(std::move(r));
+    }
+
+    cache_.invalidateTable(tName);
+    maybeCheckpoint();
+    qr.message = std::to_string(rowsBatch.size()) + " row(s) inserted into '"+tName+"'.";
 }
 
 // ── SELECT ────────────────────────────────────────────────────────────────────
@@ -278,6 +359,15 @@ void Engine::doSelect(TokenStream& ts, QueryResult& qr) {
 
     bool hasWhere=false; Condition cond;
     if (ts.checkKeyword("WHERE")) { ts.consume(); cond=parseCondition(ts); hasWhere=true; }
+    // Consume ORDER BY clause (basic - just parse and ignore for compatibility)
+    std::string orderByCol; bool orderAsc = true;
+    if (ts.checkKeyword("ORDER")) {
+        ts.consume(); ts.expectKeyword("BY");
+        orderByCol = ts.expectName();
+        if (ts.check(TT::DOT)) { ts.consume(); orderByCol = ts.expectName(); }
+        if (ts.checkKeyword("DESC")) { ts.consume(); orderAsc = false; }
+        else if (ts.checkKeyword("ASC")) { ts.consume(); }
+    }
     if (ts.check(TT::SEMICOLON)) ts.consume();
     Table& tbl = db_.tables[leftName];
 
@@ -323,6 +413,67 @@ void Engine::doSelect(TokenStream& ts, QueryResult& qr) {
             rowData.push_back(sanitize(cellStr(row.cells[ci], tbl.columns[ci].type)));
         qr.rows.push_back(std::move(rowData));
     }
+
+    // Apply ORDER BY sort if specified
+    if (!orderByCol.empty() && !qr.colNames.empty()) {
+        int sortColIdx = -1;
+        for (int i=0; i<(int)qr.colNames.size(); ++i)
+            if (qr.colNames[i] == orderByCol) { sortColIdx = i; break; }
+        if (sortColIdx >= 0) {
+            std::stable_sort(qr.rows.begin(), qr.rows.end(),
+                [&](const std::vector<std::string>& a, const std::vector<std::string>& b){
+                    return orderAsc ? (a[sortColIdx] < b[sortColIdx])
+                                    : (a[sortColIdx] > b[sortColIdx]);
+                });
+        }
+    }
+}
+
+
+// ── DELETE FROM table ─────────────────────────────────────────────────────────
+void Engine::doDelete(TokenStream& ts, QueryResult& qr) {
+    ts.expectKeyword("DELETE");
+    ts.expectKeyword("FROM");
+    std::string tName = ts.expectName();
+    if (!db_.tables.count(tName)) {
+        qr.ok=false; qr.message="Table '"+tName+"' does not exist."; return;
+    }
+    // Optional WHERE (delete matching rows only); no WHERE = delete all
+    bool hasWhere=false; Condition cond;
+    if (ts.checkKeyword("WHERE")) { ts.consume(); cond=parseCondition(ts); hasWhere=true; }
+    if (ts.check(TT::SEMICOLON)) ts.consume();
+
+    Table& tbl = db_.tables[tName];
+    if (!hasWhere) {
+        long long deleted = (long long)tbl.rows.size();
+        storage_.walDeleteAll(tName);  // WAL before memory
+        tbl.rows.clear();
+        tbl.primaryIndex.clear();
+        cache_.invalidateTable(tName);
+        maybeCheckpoint();
+        qr.message = std::to_string(deleted) + " row(s) deleted from '"+tName+"'.";
+        return;
+    }
+    // WHERE delete: filter rows
+    std::vector<Row> remaining;
+    long long deleted = 0;
+    for (auto& row : tbl.rows) {
+        std::string cc=cond.colRef; auto dot=cc.find('.');
+        if (dot!=std::string::npos) cc=cc.substr(dot+1);
+        int ci=tbl.colIndex(cc);
+        if (ci==-1) { qr.ok=false; qr.message="Column '"+cc+"' not found."; return; }
+        if (evalCond(row.cells[ci], cond.op, cond.value, tbl.columns[ci].type))
+            ++deleted;
+        else
+            remaining.push_back(std::move(row));
+    }
+    tbl.rows = std::move(remaining);
+    // Rebuild primary index after deletion
+    tbl.primaryIndex.clear();
+    for (std::size_t i=0; i<tbl.rows.size(); ++i)
+        tbl.primaryIndex[cellStr(tbl.rows[i].cells[0], tbl.columns[0].type)].push_back(i);
+    cache_.invalidateTable(tName);
+    qr.message = std::to_string(deleted) + " row(s) deleted from '"+tName+"'.";
 }
 
 // ── INNER JOIN  (hash-join equi-join — NOT cross join) ────────────────────────

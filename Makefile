@@ -16,6 +16,7 @@ LDFLAGS  = -lpthread
 SRC_COMMON = src/parser/lexer.cpp \
              src/parser/parser.cpp \
              src/cache/lru_cache.cpp \
+             src/storage/storage.cpp \
              src/query/engine.cpp
 
 SRC_API    = src/client/flexql_api.cpp
@@ -38,6 +39,14 @@ bin/test_all: tests/test_all.cpp $(SRC_API)
 	@mkdir -p bin
 	$(CXX) $(CXXFLAGS) -o $@ $^
 	@echo "  Built: $@"
+
+bin/benchmark_flexql: tests/benchmark_flexql.cpp $(SRC_API)
+	@mkdir -p bin
+	$(CXX) $(CXXFLAGS) -o $@ $^
+	@echo "  Built: $@"
+
+# Build the official benchmark binary
+benchmark: bin/benchmark_flexql
 
 # Run the full test suite (starts a temporary server on port 9099)
 test: bin/flexql-server bin/test_all
