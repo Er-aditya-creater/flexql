@@ -100,7 +100,7 @@ Results: 42 passed, 0 failed
 ## Performance Benchmark
 
 ```bash
-./scripts/benchmark.sh 127.0.0.1 9000 1000000
+./bin/benchmark_flexql 1000000
 ```
 
 Measures INSERT throughput, full scan, index lookup, range scan, DATETIME
