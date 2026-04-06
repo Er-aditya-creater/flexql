@@ -1,6 +1,6 @@
 # FlexQL
 
-A simplified SQL-like in-memory database driver implemented in C++17.
+A simplified SQL-like in-memory database driver implemented in C++17.# FlexQL
 
 ## Features
 
